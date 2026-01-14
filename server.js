@@ -1,136 +1,104 @@
 /**
  * ===============================================================================
- * APEX TITAN v87.0 (FULL BUILD) - MULTICALL & CYCLIC PATH SINGULARITY
+ * APEX TITAN v87.3 - OMNI-FINALITY + FLASHBOTS SENTRY
  * ===============================================================================
  */
 
 require('dotenv').config();
-const cluster = require('cluster');
-const os = require('os');
 const http = require('http');
-const WebSocket = require("ws");
 const { 
     ethers, JsonRpcProvider, Wallet, Contract, Interface, parseEther, formatEther 
 } = require('ethers');
-require('colors');
+const { FlashbotsBundleProvider } = require('@flashbots/ethers-provider-bundle');
 
-// ==========================================
-// 1. MATHEMATICAL ENGINE (CYCLIC PATH)
-// ==========================================
-class ArbitrageMath {
-    /**
-     * Uniswap V2 Constant Product Formula: (dy = (dx * 997 * y) / (x * 1000 + dx * 997))
-     * Includes 0.3% fee per hop.
-     */
-    static getAmountOut(amountIn, reserveIn, reserveOut) {
-        if (amountIn <= 0n) return 0n;
-        const amountInWithFee = amountIn * 997n;
-        const numerator = amountInWithFee * reserveOut;
-        const denominator = (reserveIn * 1000n) + amountInWithFee;
-        return numerator / denominator;
-    }
-
-    static calculateCyclicProfit(amountIn, reservesArray) {
-        let currentAmount = amountIn;
-        for (const [resIn, resOut] of reservesArray) {
-            currentAmount = this.getAmountOut(currentAmount, resIn, resOut);
-        }
-        return currentAmount - amountIn; // Positive = Real Net Profit
-    }
+// --- 1. GLOBAL SCOPE INITIALIZATION ---
+try {
+    global.colors = require('colors');
+    global.axios = require('axios');
+    global.Sentiment = require('sentiment');
+    global.colors.enable();
+} catch (e) {
+    console.log("CRITICAL: Run 'npm install ethers colors axios sentiment @flashbots/ethers-provider-bundle'");
+    process.exit(1);
 }
 
-// ==========================================
-// 2. MULTICALL AGGREGATOR
-// ==========================================
-class MulticallScanner {
-    constructor(provider, multicallAddress) {
-        this.provider = provider;
-        this.address = multicallAddress;
-        this.iface = new Interface([
-            "function aggregate(tuple(address target, bytes callData)[] calls) view returns (uint256 blockNumber, bytes[] returnData)"
-        ]);
-        this.poolIface = new Interface([
-            "function getReserves() external view returns (uint112, uint112, uint32)"
-        ]);
-    }
+const colors = global.colors;
 
-    async getBulkReserves(poolAddresses) {
-        const calls = poolAddresses.map(target => ({
-            target,
-            callData: this.poolIface.encodeFunctionData("getReserves")
-        }));
-
-        try {
-            const tx = { to: this.address, data: this.iface.encodeFunctionData("aggregate", [calls]) };
-            const result = await this.provider.call(tx);
-            const [, returnData] = this.iface.decodeFunctionResult("aggregate", result);
-            
-            return returnData.map(data => {
-                const r = this.poolIface.decodeFunctionResult("getReserves", data);
-                return [BigInt(r[0]), BigInt(r[1])]; // [reserve0, reserve1]
-            });
-        } catch (e) {
-            return [];
-        }
-    }
-}
-
-// ==========================================
-// 3. CORE INFRASTRUCTURE
-// ==========================================
-const NETWORKS = {
-    ETHEREUM: { chainId: 1, rpc: process.env.ETH_RPC, multicall: "0xcA11bde05977b3631167028862bE2a173976CA11", moat: "0.01", router: "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D" },
-    BASE: { chainId: 8453, rpc: process.env.BASE_RPC, multicall: "0xcA11bde05977b3631167028862bE2a173976CA11", moat: "0.005", router: "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24" }
-};
-
+// Hard-capture env variables
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const EXECUTOR_ADDRESS = process.env.EXECUTOR_ADDRESS;
+const FB_AUTH_KEY = process.env.FB_AUTH_KEY || PRIVATE_KEY; // Unique key for FB reputation
 
-if (cluster.isPrimary) {
-    console.log(`\n⚡ APEX TITAN v87.0 ONLINE | MULTICALL ACTIVE`.gold.bold);
-    Object.keys(NETWORKS).forEach(chain => cluster.fork({ TARGET_CHAIN: chain }));
-} else {
-    runWorker();
-}
+const POOL_MAP = {
+    ETHEREUM: ["0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"],
+    BASE: ["0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24", "0x25d887Ce7a35172C62FeBFD67a1856F20FaEbb00"]
+};
 
-async function runWorker() {
-    const name = process.env.TARGET_CHAIN;
-    const config = NETWORKS[name];
-    const provider = new JsonRpcProvider(config.rpc, config.chainId, { staticNetwork: true });
-    const wallet = new Wallet(PRIVATE_KEY, provider);
-    const scanner = new MulticallScanner(provider, config.multicall);
+const NETWORKS = {
+    ETHEREUM: { chainId: 1, rpc: process.env.ETH_RPC, multicall: "0xcA11bde05977b3631167028862bE2a173976CA11", router: "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D", fb: "https://relay.flashbots.net" },
+    BASE: { chainId: 8453, rpc: process.env.BASE_RPC, multicall: "0xcA11bde05977b3631167028862bE2a173976CA11", router: "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24" }
+};
 
-    console.log(`[${name}] Worker Engine Engaged.`.cyan);
+// ==========================================
+// 2. CORE OMNI-ENGINE
+// ==========================================
+class ApexOmniGovernor {
+    constructor() {
+        this.providers = {}; this.wallets = {}; this.fbProviders = {};
+        this.multiAbi = ["function tryAggregate(bool requireSuccess, tuple(address target, bytes callData)[] calls) view returns (tuple(bool success, bytes returnData)[] returnData)"];
+        this.pairAbi = ["function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)"];
+        this.execAbi = ["function executeTriangle(address router, address tokenA, address tokenB, uint256 amountIn) external payable"];
+        
+        this.init();
+    }
 
-    // Startup Diagnostic Ping
-    try {
-        await wallet.sendTransaction({ to: wallet.address, value: 0, gasLimit: 21000 });
-        console.log(`[${name}] ✅ Diagnostic Ping Successful.`.green);
-    } catch (e) { console.log(`[${name}] ⚠️ Ping Failed (Check balance).`.red); }
+    async init() {
+        for (const [name, config] of Object.entries(NETWORKS)) {
+            const provider = new JsonRpcProvider(config.rpc, config.chainId, { staticNetwork: true });
+            this.providers[name] = provider;
+            this.wallets[name] = new Wallet(PRIVATE_KEY, provider);
 
-    // THE MAIN ARBITRAGE LOOP
-    while (true) {
-        try {
-            const balance = await provider.getBalance(wallet.address);
-            const tradeSize = balance - parseEther(config.moat);
-
-            if (tradeSize > parseEther("0.001")) {
-                // Example: Checking 3 pools in a cycle (ETH -> TOKEN A -> TOKEN B -> ETH)
-                const pools = [
-                    "0x...", // Pool 1: ETH/TokenA
-                    "0x...", // Pool 2: TokenA/TokenB
-                    "0x..."  // Pool 3: TokenB/ETH
-                ];
-
-                const reserves = await scanner.getBulkReserves(pools);
-                const netProfit = ArbitrageMath.calculateCyclicProfit(tradeSize, reserves);
-
-                if (netProfit > 0n) {
-                    console.log(`[${name}] 💰 Arb Found! Net Profit: ${formatEther(netProfit)} ETH`.gold);
-                    // Strike logic goes here...
-                }
+            if (config.fb) {
+                const authSigner = new Wallet(FB_AUTH_KEY, provider);
+                this.fbProviders[name] = await FlashbotsBundleProvider.create(provider, authSigner, config.fb);
+                console.log(colors.cyan(`[${name}] Flashbots Sentry Active.`));
             }
-        } catch (e) { /* Suppressed network errors */ }
-        await new Promise(r => setTimeout(r, 2000));
+        }
+    }
+
+    async scanAndStrike(name) {
+        const config = NETWORKS[name];
+        const pools = POOL_MAP[name];
+        try {
+            const multi = new Contract(config.multicall, this.multiAbi, this.providers[name]);
+            const itf = new Interface(this.pairAbi);
+            const calls = pools.map(addr => ({ target: addr, callData: itf.encodeFunctionData("getReserves") }));
+
+            const [balance, [, returnData]] = await Promise.all([
+                this.providers[name].getBalance(this.wallets[name].address),
+                multi.tryAggregate(false, calls)
+            ]);
+
+            const reserves = returnData.filter(r => r.success).map(r => itf.decodeFunctionResult("getReserves", r.returnData));
+            const tradeSize = balance - parseEther("0.01"); // Simple Moat
+
+            if (tradeSize > 0n && reserves.length >= 2) {
+                // Insert ArbitrageMath.calculateCyclicProfit check here
+                console.log(colors.gray(`[${name}] Market Synced. Balance: ${formatEther(balance).slice(0,6)} ETH`));
+            }
+        } catch (e) { console.log(colors.red(`[${name}] Scan Lag.`)); }
+    }
+
+    async run() {
+        console.log(colors.bold(colors.yellow("\n⚡ APEX TITAN v87.3 | OMNI-FINALITY READY\n")));
+        while (true) {
+            for (const name of Object.keys(NETWORKS)) await this.scanAndStrike(name);
+            await new Promise(r => setTimeout(r, 5000));
+        }
     }
 }
+
+// --- 3. IGNITION ---
+const governor = new ApexOmniGovernor();
+http.createServer((req, res) => { res.writeHead(200); res.end("OPERATIONAL"); }).listen(process.env.PORT || 8080);
+governor.run();
