@@ -1,13 +1,12 @@
 /**
  * ===============================================================================
- * APEX TITAN v87.9 - DUAL-DEX STRIKE ENGINE
+ * APEX TITAN v88.0 - STRIKE FINALITY
  * ===============================================================================
  */
 
 require('dotenv').config();
 const colors = require('colors');
 colors.enable();
-global.colors = colors;
 
 const { 
     ethers, JsonRpcProvider, Wallet, Contract, Interface, parseEther, formatEther, Network, getAddress 
@@ -17,26 +16,31 @@ const {
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const EXECUTOR = process.env.EXECUTOR_ADDRESS;
 
-// We compare Uniswap V2 vs Sushiswap V2 to find trades
-const POOL_MAP = {
+const ROUTERS = {
     ETHEREUM: {
-        uni: "0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc", // USDC/WETH
-        sushi: "0x397ff1542f962076d0bfe58ea045ffa2d347aca0" // USDC/WETH
+        uni: "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D",
+        sushi: "0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F"
     },
     BASE: {
-        uni: "0x88A43bbDF9D098eEC7bCEda4e2494615dfD9bB9C", // USDC/WETH
-        sushi: "0x2e0a2da557876a91726719114777c082531d2794" // USDC/WETH
+        uni: "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24", // Uniswap V2 (Base)
+        sushi: "0x6BDED42c679f1ee30611fa44f83736765790757a"  // Sushi Base
     }
 };
 
-const NETWORKS = {
-    ETHEREUM: { chainId: 1, rpcs: [process.env.ETH_RPC, "https://eth.llamarpc.com"].filter(Boolean), multicall: "0xcA11bde05977b3631167028862bE2a173976CA11" },
-    BASE: { chainId: 8453, rpcs: [process.env.BASE_RPC, "https://base.llamarpc.com"].filter(Boolean), multicall: "0xcA11bde05977b3631167028862bE2a173976CA11" }
+const POOL_MAP = {
+    ETHEREUM: { uni: "0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc", sushi: "0x397ff1542f962076d0bfe58ea045ffa2d347aca0" },
+    BASE:     { uni: "0x88A43bbDF9D098eEC7bCEda4e2494615dfD9bB9C", sushi: "0x2e0a2da557876a91726719114777c082531d2794" }
 };
 
-// --- 2. MATH ENGINE ---
+const TOKENS = {
+    ETHEREUM: { weth: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", usdc: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48" },
+    BASE:     { weth: "0x4200000000000000000000000000000000000006", usdc: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" }
+};
+
+// --- 2. MATH UTILITIES ---
 function getAmountOut(amountIn, resIn, resOut) {
-    const amountInWithFee = BigInt(amountIn) * 997n; // 0.3% Fee
+    if (resIn === 0n || resOut === 0n) return 0n;
+    const amountInWithFee = BigInt(amountIn) * 997n;
     return (amountInWithFee * BigInt(resOut)) / ((BigInt(resIn) * 1000n) + amountInWithFee);
 }
 
@@ -44,80 +48,79 @@ class ApexOmniGovernor {
     constructor() {
         this.providers = {}; this.wallets = {}; this.rpcIndex = { ETHEREUM: 0, BASE: 0 };
         this.multiAbi = ["function tryAggregate(bool requireSuccess, tuple(address target, bytes callData)[] calls) view returns (tuple(bool success, bytes returnData)[] returnData)"];
-        this.pairAbi = ["function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)"];
-        this.execAbi = ["function executeStrike(address routerA, address routerB, address tokenA, address tokenB, uint256 amount) external payable"];
+        this.v2Abi = ["function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)"];
+        this.execAbi = ["function executeTriangle(address routerA, address routerB, address tokenA, address tokenB, uint256 amount) external payable"];
         
-        for (const name of Object.keys(NETWORKS)) this.rotateProvider(name);
+        for (const name of Object.keys(ROUTERS)) this.rotateProvider(name);
     }
 
     async rotateProvider(name) {
-        const config = NETWORKS[name];
-        const url = config.rpcs[this.rpcIndex[name] % config.rpcs.length];
-        this.providers[name] = new JsonRpcProvider(url, undefined, { staticNetwork: Network.from(config.chainId) });
+        const rpcs = [process.env[`${name}_RPC`], "https://eth.llamarpc.com", "https://base.llamarpc.com"].filter(Boolean);
+        const url = rpcs[this.rpcIndex[name] % rpcs.length];
+        this.providers[name] = new JsonRpcProvider(url, undefined, { staticNetwork: true });
         this.wallets[name] = new Wallet(PRIVATE_KEY, this.providers[name]);
-        console.log(colors.cyan(`[${name}] RPC Active: ${url.split('/')[2]}`));
+        console.log(colors.cyan(`[${name}] Provider: ${url.split('/')[2]}`));
     }
 
-    async scanAndStrike(name) {
-        const poolSet = POOL_MAP[name];
-        const config = NETWORKS[name];
-        
+    async scan(name) {
+        const pools = POOL_MAP[name];
+        const multi = new Contract("0xcA11bde05977b3631167028862bE2a173976CA11", this.multiAbi, this.providers[name]);
+        const v2 = new Interface(this.v2Abi);
+
         try {
-            const multi = new Contract(config.multicall, this.multiAbi, this.providers[name]);
-            const itf = new Interface(this.pairAbi);
             const calls = [
-                { target: getAddress(poolSet.uni), callData: itf.encodeFunctionData("getReserves") },
-                { target: getAddress(poolSet.sushi), callData: itf.encodeFunctionData("getReserves") }
+                { target: getAddress(pools.uni), callData: v2.encodeFunctionData("getReserves") },
+                { target: getAddress(pools.sushi), callData: v2.encodeFunctionData("getReserves") }
             ];
 
             const results = await multi.tryAggregate(false, calls);
-            if (!results[0].success || !results[1].success) return;
+            if (!results[0].success || !results[1].success) {
+                process.stdout.write(colors.gray("?"));
+                return;
+            }
 
-            const resUni = itf.decodeFunctionResult("getReserves", results[0].returnData);
-            const resSushi = itf.decodeFunctionResult("getReserves", results[1].returnData);
+            const resUni = v2.decodeFunctionResult("getReserves", results[0].returnData);
+            const resSushi = v2.decodeFunctionResult("getReserves", results[1].returnData);
 
-            // Math Check: Buy 0.1 ETH on Uni, sell on Sushi
+            // Test 0.1 ETH trade
             const amountIn = parseEther("0.1");
-            const tokensFromUni = getAmountOut(amountIn, resUni[0], resUni[1]);
-            const ethBackFromSushi = getAmountOut(tokensFromUni, resSushi[1], resSushi[0]);
+            const tokens = getAmountOut(amountIn, resUni[0], resUni[1]);
+            const back = getAmountOut(tokens, resSushi[1], resSushi[0]);
 
-            if (ethBackFromSushi > amountIn) {
-                const profit = ethBackFromSushi - amountIn;
-                console.log(colors.green.bold(`\n[${name}] 💰 TRADE SIGNAL: +${formatEther(profit)} ETH`));
-                await this.execute(name, amountIn);
+            if (back > amountIn + parseEther("0.0001")) {
+                console.log(colors.green.bold(`\n[${name}] 💰 SIGNAL: Profit ${formatEther(back - amountIn)} ETH`));
+                await this.strike(name, amountIn);
             } else {
                 process.stdout.write(colors.gray("."));
             }
         } catch (e) {
             this.rpcIndex[name]++;
-            this.rotateProvider(name);
+            await this.rotateProvider(name);
         }
     }
 
-    async execute(name, amount) {
-        const wallet = this.wallets[name];
-        const contract = new Contract(EXECUTOR, this.execAbi, wallet);
+    async strike(name, amount) {
+        const config = ROUTERS[name];
+        const tokens = TOKENS[name];
+        const executor = new Contract(EXECUTOR, this.execAbi, this.wallets[name]);
+
         try {
-            console.log(colors.yellow(`[${name}] Sending Strike Transaction...`));
-            const tx = await contract.executeStrike(
-                "0x...", // Router A
-                "0x...", // Router B
-                "0x...", // Token A (WETH)
-                "0x...", // Token B (USDC)
-                amount,
-                { gasLimit: 500000 }
+            console.log(colors.yellow(`[STRIKE] Broadcasting to ${name}...`));
+            const tx = await executor.executeTriangle(
+                config.uni, config.sushi, tokens.weth, tokens.usdc, amount,
+                { value: amount, gasLimit: 400000 }
             );
             console.log(colors.magenta.bold(`🚀 STRIKE SUCCESS: ${tx.hash}`));
             await tx.wait();
         } catch (e) {
-            console.log(colors.red(`[${name}] Trade Reverted: ${e.reason || "Gas/Slippage"}`));
+            console.log(colors.red(`[STRIKE] Failed: ${e.reason || "Sim Revert"}`));
         }
     }
 
     async run() {
-        console.log(colors.yellow.bold("\n⚡ APEX TITAN v87.9 | STRIKE ENGINE ONLINE\n"));
+        console.log(colors.yellow.bold("\n⚡ APEX TITAN v88.0 | STRIKE FINALITY\n"));
         while (true) {
-            for (const name of Object.keys(NETWORKS)) await this.scanAndStrike(name);
+            for (const name of Object.keys(ROUTERS)) await this.scan(name);
             await new Promise(r => setTimeout(r, 2000));
         }
     }
